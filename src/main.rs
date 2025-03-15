@@ -719,57 +719,65 @@ fn main() {
         }
         let secp = Secp256k1::new();
         let mut address_entries = Vec::new();
-        if addr_type == 1 {
-            for i in start_index..=end_index {
-                let path_str = if use_hardened_index {
-                    format!("m/84'/0'/0'/0/{}'", i)
-                } else {
-                    format!("m/84'/0'/0'/0/{}", i)
-                };
-                let path = path_str.parse::<DerivationPath>()
-                    .expect("Invalid derivation path");
-                let child_xprv = provided_xprv.derive_priv(&secp, &path)
-                    .expect("Derivation failed");
-                let child_pubkey_secp = PublicKey::from_secret_key(&secp, &child_xprv.private_key);
-                let child_bitcoin_pubkey = BitcoinPubKey {
-                    compressed: true,
-                    inner: child_pubkey_secp,
-                };
-                let comp_pubkey = CompressedPublicKey::from_slice(&child_bitcoin_pubkey.to_bytes())
-                    .expect("Failed to create compressed public key");
-                let addr_btc = Address::p2wpkh(&comp_pubkey, Network::Bitcoin);
-                let pubkey_hex = hex::encode(child_pubkey_secp.serialize());
-                let privkey_hex = hex::encode(child_xprv.private_key.secret_bytes());
-                address_entries.push(AddressEntry {
-                    index: i,
-                    address: addr_btc.to_string(),
-                    pubkey: pubkey_hex,
-                    privkey: privkey_hex,
-                });
-            }
-        } else {
-            for i in start_index..=end_index {
-                let path_str = if use_hardened_index {
-                    format!("m/44'/60'/0'/0/{}'", i)
-                } else {
-                    format!("m/44'/60'/0'/0/{}", i)
-                };
-                let path = path_str.parse::<DerivationPath>()
-                    .expect("Invalid derivation path");
-                let child_xprv = provided_xprv.derive_priv(&secp, &path)
-                    .expect("Derivation failed");
-                let child_pubkey = PublicKey::from_secret_key(&secp, &child_xprv.private_key);
-                let eth_address = ethereum_address_from_pubkey(&child_pubkey);
-                let pubkey_hex = hex::encode(child_pubkey.serialize());
-                let privkey_hex = hex::encode(child_xprv.private_key.secret_bytes());
-                address_entries.push(AddressEntry {
-                    index: i,
-                    address: eth_address,
-                    pubkey: pubkey_hex,
-                    privkey: privkey_hex,
-                });
+
+        match addr_type {
+            1 => {
+                for i in start_index..=end_index {
+                    let path_str = if use_hardened_index {
+                        format!("m/84'/0'/0'/0/{}'", i)
+                    } else {
+                        format!("m/84'/0'/0'/0/{}", i)
+                    };
+                    let path = path_str.parse::<DerivationPath>()
+                        .expect("Invalid derivation path");
+                    let child_xprv = provided_xprv.derive_priv(&secp, &path)
+                        .expect("Derivation failed");
+                    let child_pubkey_secp = PublicKey::from_secret_key(&secp, &child_xprv.private_key);
+                    let child_bitcoin_pubkey = BitcoinPubKey {
+                        compressed: true,
+                        inner: child_pubkey_secp,
+                    };
+                    let comp_pubkey = CompressedPublicKey::from_slice(&child_bitcoin_pubkey.to_bytes())
+                        .expect("Failed to create compressed public key");
+                    let addr_btc = Address::p2wpkh(&comp_pubkey, Network::Bitcoin);
+                    let pubkey_hex = hex::encode(child_pubkey_secp.serialize());
+                    let privkey_hex = hex::encode(child_xprv.private_key.secret_bytes());
+                    address_entries.push(AddressEntry {
+                        index: i,
+                        address: addr_btc.to_string(),
+                        pubkey: pubkey_hex,
+                        privkey: privkey_hex,
+                    });
+                }
+            },
+            2 => {
+                for i in start_index..=end_index {
+                    let path_str = if use_hardened_index {
+                        format!("m/44'/60'/0'/0/{}'", i)
+                    } else {
+                        format!("m/44'/60'/0'/0/{}", i)
+                    };
+                    let path = path_str.parse::<DerivationPath>()
+                        .expect("Invalid derivation path");
+                    let child_xprv = provided_xprv.derive_priv(&secp, &path)
+                        .expect("Derivation failed");
+                    let child_pubkey = PublicKey::from_secret_key(&secp, &child_xprv.private_key);
+                    let eth_address = ethereum_address_from_pubkey(&child_pubkey);
+                    let pubkey_hex = hex::encode(child_pubkey.serialize());
+                    let privkey_hex = hex::encode(child_xprv.private_key.secret_bytes());
+                    address_entries.push(AddressEntry {
+                        index: i,
+                        address: eth_address,
+                        pubkey: pubkey_hex,
+                        privkey: privkey_hex,
+                    });
+                }
+            },
+            _ => {
+                println!("Address type not supported!");
             }
         }
+        
         if let Err(e) = run_address_table_ui(address_entries, addr_type) {
             eprintln!("Error in UI: {}", e);
         }
