@@ -26,9 +26,8 @@ use aes_gcm::{
 };
 use bitcoin::{
     bip32::{DerivationPath, Xpriv},
-    key::CompressedPublicKey,
     secp256k1::{PublicKey, Secp256k1},
-    Address, Network, PublicKey as BitcoinPubKey,
+    Address, Network,
 };
 use bs58;
 use hmac::Hmac;
@@ -38,6 +37,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sskr::{sskr_combine, sskr_generate, GroupSpec, Secret, Spec};
 use tiny_keccak::Hasher;
+use bip39;
+use terminal_size;
+
+use slip10::{derive_key_from_path, Curve, BIP32Path};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -225,6 +229,28 @@ fn to_checksum_address(address: &str) -> String {
     checksum_address
 }
 
+// New function for deriving XRP address from public key.
+fn xrp_address_from_pubkey(pubkey: &PublicKey) -> String {
+    // Use the compressed public key bytes.
+    let pubkey_bytes = pubkey.serialize();
+    // Compute SHA256 hash of the public key.
+    let sha256_hash = Sha256::digest(&pubkey_bytes);
+    // Compute RIPEMD160 hash.
+    use bitcoin::hashes::{ripemd160, Hash};
+    let ripemd_hash = ripemd160::Hash::hash(&sha256_hash);
+    // Build the payload with XRP version byte (0x00).
+    let mut payload = Vec::with_capacity(21);
+    payload.push(0x00);
+    payload.extend_from_slice(&ripemd_hash[..]);
+    // Compute checksum: first 4 bytes of double SHA256 of the payload.
+    let double_hash = Sha256::digest(&Sha256::digest(&payload));
+    let checksum = &double_hash[0..4];
+    payload.extend_from_slice(checksum);
+    // Use Ripple's Base58 alphabet. Note the use of a byte literal and borrowing.
+    let alphabet = bs58::Alphabet::new(b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz").unwrap();
+    bs58::encode(payload).with_alphabet(&alphabet).into_string()
+}
+
 fn print_dashed_line() {
     if let Some((width, _)) = terminal_size::terminal_size() {
         println!("{}", "─".repeat(width.0 as usize));
@@ -275,7 +301,16 @@ fn mnemonic_to_share(mnemonic: &str, language: bip39::Language) -> Option<Vec<u8
     let share_bytes = bits_to_bytes(share_bits);
     Some(share_bytes)
 }
-
+fn validate_mnemonic(mnemonic: &str, language: bip39::Language) -> Result<(), String> {
+    let wordlist = language.word_list();
+    for (i, word) in mnemonic.split_whitespace().enumerate() {
+        if !wordlist.contains(&word) {
+            // i is zero-based; add 1 for human-friendly indexing.
+            return Err(format!("Mnemonic contains an unknown word at position {}: {}", i + 1, word));
+        }
+    }
+    Ok(())
+}
 fn language_from_choice(_choice: u8) -> bip39::Language {
     bip39::Language::English
 }
@@ -420,7 +455,6 @@ fn run_backup_text_ui(
                         disable_raw_mode()?;
                         return Ok(());
                     },
-                    
                     _ => {}
                 }
             }
@@ -466,7 +500,15 @@ fn run_address_table_ui(address_entries: Vec<AddressEntry>, addr_type: u8) -> Re
                     .bottom_margin(1))
                 .block(Block::default()
                     .borders(Borders::ALL)
-                    .title(if addr_type == 1 { "Derived Bitcoin Addresses" } else { "Derived Ethereum Addresses" }));
+                    .title(if addr_type == 1 {
+                        "Derived Bitcoin Addresses"
+                    } else if addr_type == 2 {
+                        "Derived Ethereum Addresses"
+                    } else if addr_type == 3 {
+                        "Derived XRP Addresses"
+                    } else {
+                        "Derived Solana Addresses"
+                    }));
             f.render_widget(table, chunks[0]);
             let note = Paragraph::new("Press [Tab] to toggle private key visibility, [q] to exit.")
                 .style(Style::default().fg(TuiColor::White));
@@ -536,7 +578,7 @@ fn main() {
     \x1b[37m        - Recommended for \x1b[4;32mmaximum security scenarios\x1b[24m\x1b[37m, where preventing any form of public key derivation is necessary.\x1b[0m
 
     \x1b[1;37mSeed Backup & JSON Encryption:\x1b[0m
-    \x1b[37m  - The JSON backup is encrypted to secure your seed data.
+    \x1b[37m- The JSON backup is encrypted to secure your seed data.
     - When entering your seed phrase, you can input one or multiple words separated by spaces.
     - Each word is automatically validated; once a valid word is entered, the prompt will advance to the next.
     - For a complete 24-word seed, the final (24th) word is computed automatically based on the required checksum.\x1b[0m
@@ -554,7 +596,7 @@ fn main() {
     stdout.execute(ResetColor).unwrap();
     println!("  1: Generate a new seed");
     println!("  2: Recover an existing seed from SSKR shares");
-    println!("  3: Generate wallet addresses from a provided BIP-32 Extended Private Key (xprv)");
+    println!("  3: Derive wallet addresses from entropy or seed phrase");
     println!("  4: Decrypt and read a saved encrypted JSON backup");
 
     let seed_option = loop {
@@ -645,66 +687,137 @@ fn main() {
         stdout.execute(crossterm::cursor::MoveTo(0, 0)).unwrap();
         println!();
         stdout.execute(SetForegroundColor(theme_colors.header)).unwrap();
-        println!("You have chosen to generate wallet addresses from a provided xprv.");
+        println!("You have chosen to derive wallet addresses from entropy or seed phrase.");
         stdout.execute(ResetColor).unwrap();
-        let input_xprv = prompt_user_input("\nEnter your BIP-32 Extended Private Key (xprv): ", theme_colors.input_prompt);
-        let decoded = bs58::decode(&input_xprv)
-            .with_check(None)
-            .into_vec()
-            .expect("Invalid base58 encoding for xprv");
-        let provided_xprv = Xpriv::decode(&decoded)
-            .expect("Failed to decode xprv");
-    
-            stdout.execute(Clear(ClearType::All)).unwrap();
-            stdout.execute(crossterm::cursor::MoveTo(0, 0)).unwrap();
-            println!("Select address type:");
-            print!("  1: Bitcoin ");
-            stdout.execute(SetForegroundColor(theme_colors.final_output)).unwrap();
-            println!("(Native SegWit P2WPKH - m/84'/0'/0'/0/i)");
-            stdout.execute(ResetColor).unwrap();
-            print!("  2: Ethereum/EVM ");
-            stdout.execute(SetForegroundColor(theme_colors.final_output)).unwrap();
-            println!("(m/44'/60'/0'/0/i)");
-            stdout.execute(ResetColor).unwrap();
-            
-        let addr_type = loop {
-            let input = prompt_user_input("\nEnter your selection (1 or 2): ", theme_colors.input_prompt);
-            match input.parse::<u8>() {
-                Ok(1) | Ok(2) => break input.parse::<u8>().unwrap(),
-                _ => {
-                    stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
-                    println!("Invalid selection. Please enter 1 or 2.");
-                    stdout.execute(ResetColor).unwrap();
+
+        let (mnemonic, seed) = loop {
+            let input_value = prompt_user_input(
+                "\nEnter your entropy (hex encoded) or seed phrase (BIP-39 mnemonic): ",
+                theme_colors.input_prompt,
+            );
+            let trimmed_input = input_value.trim();
+        
+            let passphrase_input = prompt_user_input(
+                "\nEnter your optional passphrase (leave blank for none): ",
+                theme_colors.input_prompt,
+            );
+        
+            if trimmed_input.contains(' ') {
+                match validate_mnemonic(trimmed_input, bip39::Language::English) {
+                    Ok(()) => {
+                        let mnemonic = bip39::Mnemonic::parse_in_normalized(bip39::Language::English, trimmed_input)
+                            .expect("Valid mnemonic");
+                        let seed = mnemonic.to_seed(&passphrase_input);
+                        break (mnemonic, seed);
+                    },
+                    Err(e) => {
+                        stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
+                        println!("{}", e);
+                        stdout.execute(ResetColor).unwrap();
+                        continue;
+                    }
+                }            
+            } else {
+                match hex::decode(trimmed_input) {
+                    Ok(entropy_bytes) => {
+                        if ![16, 20, 24, 28, 32].contains(&entropy_bytes.len()) {
+                            stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
+                            println!("Invalid entropy length. Expected 128, 160, 192, 224, or 256 bits. Please try again.");
+                            stdout.execute(ResetColor).unwrap();
+                            continue;
+                        }
+                        match bip39::Mnemonic::from_entropy(&entropy_bytes) {
+                            Ok(mnemonic) => {
+                                let seed = mnemonic.to_seed(&passphrase_input);
+                                break (mnemonic, seed);
+                            },
+                            Err(e) => {
+                                stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
+                                println!("Failed to create mnemonic from entropy: {}. Please try again.", e);
+                                stdout.execute(ResetColor).unwrap();
+                                continue;
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
+                        println!("Hex decode error: {}. Please try again.", e);
+                        stdout.execute(ResetColor).unwrap();
+                        continue;
+                    }
                 }
             }
-        };
-    
+        };              
+
+        let _mnemonic_phrase = mnemonic.to_string();
+        let master_xprv = Xpriv::new_master(Network::Bitcoin, &seed)
+            .expect("Unable to create master key");
+
         stdout.execute(Clear(ClearType::All)).unwrap();
         stdout.execute(crossterm::cursor::MoveTo(0, 0)).unwrap();
-        println!("\nSelect derivation index type for the final component:");
-        print!("  1: Fully Hardened Derivation ");
+        println!("Select address type:");
+        print!("  1: Bitcoin ");
         stdout.execute(SetForegroundColor(theme_colors.final_output)).unwrap();
-        print!("(e.g., i') ");
+        println!("(Native SegWit P2WPKH - m/84'/0'/0'/0/i)");
         stdout.execute(ResetColor).unwrap();
-        print!("\x1b[1;31;5m[!]\x1b[0m"); 
-        println!();       
-        print!("  2: Standard Derivation ");
+        print!("  2: Ethereum/EVM ");
         stdout.execute(SetForegroundColor(theme_colors.final_output)).unwrap();
-        println!("(e.g., i)");
+        println!("(BIP-44 - m/44'/60'/0'/0/i)");
         stdout.execute(ResetColor).unwrap();
-        
-        let index_choice = loop {
-            let input = prompt_user_input("\nEnter your selection (1 or 2): ", theme_colors.input_prompt);
+        print!("  3: XRP ");
+        stdout.execute(SetForegroundColor(theme_colors.final_output)).unwrap();
+        println!("(BIP-44 - m/44'/144'/0'/0/i)");
+        stdout.execute(ResetColor).unwrap();
+        print!("  4: Solana ");
+        stdout.execute(SetForegroundColor(theme_colors.final_output)).unwrap();
+        println!("(BIP-44 - m/44'/501'/0'/0')");
+        stdout.execute(ResetColor).unwrap();
+
+        let addr_type = loop {
+            let input = prompt_user_input("\nEnter your selection (1-4): ", theme_colors.input_prompt);
             match input.parse::<u8>() {
-                Ok(1) | Ok(2) => break input.parse::<u8>().unwrap(),
+                Ok(1) | Ok(2) | Ok(3) | Ok(4) => break input.parse::<u8>().unwrap(),
                 _ => {
                     stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
-                    println!("Invalid selection. Please enter 1 or 2.");
+                    println!("Invalid selection. Please enter 1, 2, 3, or 4.");
                     stdout.execute(ResetColor).unwrap();
                 }
             }
         };
-        let use_hardened_index = index_choice == 1;
+
+        let use_hardened_index = if addr_type == 1 || addr_type == 2 {
+            stdout.execute(Clear(ClearType::All)).unwrap();
+            stdout.execute(crossterm::cursor::MoveTo(0, 0)).unwrap();
+            println!("\nSelect derivation index type for the final component:");
+            print!("  1: Fully Hardened Derivation ");
+            stdout.execute(SetForegroundColor(theme_colors.final_output)).unwrap();
+            print!("(e.g., i') ");
+            stdout.execute(ResetColor).unwrap();
+            print!("\x1b[1;31;5m[!]\x1b[0m");
+            println!();
+            print!("  2: Standard Derivation ");
+            stdout.execute(SetForegroundColor(theme_colors.final_output)).unwrap();
+            println!("(e.g., i)");
+            stdout.execute(ResetColor).unwrap();
+            
+            let index_choice = loop {
+                let input = prompt_user_input("\nEnter your selection (1 or 2): ", theme_colors.input_prompt);
+                match input.parse::<u8>() {
+                    Ok(1) | Ok(2) => break input.parse::<u8>().unwrap(),
+                    _ => {
+                        stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
+                        println!("Invalid selection. Please enter 1 or 2.");
+                        stdout.execute(ResetColor).unwrap();
+                    }
+                }
+            };
+            index_choice == 1
+        } else if addr_type == 3 {
+            false
+        } else {
+            true
+        };
+
         let range_input = prompt_user_input("\nEnter address index range (e.g., 5-100): ", theme_colors.input_prompt);
         let parts: Vec<&str> = range_input.trim().split('-').collect();
         if parts.len() != 2 {
@@ -717,11 +830,13 @@ fn main() {
             println!("Start index cannot be greater than end index.");
             return;
         }
+        
         let secp = Secp256k1::new();
         let mut address_entries = Vec::new();
 
         match addr_type {
             1 => {
+                // Bitcoin derivation
                 for i in start_index..=end_index {
                     let path_str = if use_hardened_index {
                         format!("m/84'/0'/0'/0/{}'", i)
@@ -730,14 +845,14 @@ fn main() {
                     };
                     let path = path_str.parse::<DerivationPath>()
                         .expect("Invalid derivation path");
-                    let child_xprv = provided_xprv.derive_priv(&secp, &path)
+                    let child_xprv = master_xprv.derive_priv(&secp, &path)
                         .expect("Derivation failed");
                     let child_pubkey_secp = PublicKey::from_secret_key(&secp, &child_xprv.private_key);
-                    let child_bitcoin_pubkey = BitcoinPubKey {
+                    let child_bitcoin_pubkey = bitcoin::PublicKey {
                         compressed: true,
                         inner: child_pubkey_secp,
                     };
-                    let comp_pubkey = CompressedPublicKey::from_slice(&child_bitcoin_pubkey.to_bytes())
+                    let comp_pubkey = bitcoin::key::CompressedPublicKey::from_slice(&child_bitcoin_pubkey.to_bytes())
                         .expect("Failed to create compressed public key");
                     let addr_btc = Address::p2wpkh(&comp_pubkey, Network::Bitcoin);
                     let pubkey_hex = hex::encode(child_pubkey_secp.serialize());
@@ -751,6 +866,7 @@ fn main() {
                 }
             },
             2 => {
+                // Ethereum derivation
                 for i in start_index..=end_index {
                     let path_str = if use_hardened_index {
                         format!("m/44'/60'/0'/0/{}'", i)
@@ -759,7 +875,7 @@ fn main() {
                     };
                     let path = path_str.parse::<DerivationPath>()
                         .expect("Invalid derivation path");
-                    let child_xprv = provided_xprv.derive_priv(&secp, &path)
+                    let child_xprv = master_xprv.derive_priv(&secp, &path)
                         .expect("Derivation failed");
                     let child_pubkey = PublicKey::from_secret_key(&secp, &child_xprv.private_key);
                     let eth_address = ethereum_address_from_pubkey(&child_pubkey);
@@ -768,6 +884,54 @@ fn main() {
                     address_entries.push(AddressEntry {
                         index: i,
                         address: eth_address,
+                        pubkey: pubkey_hex,
+                        privkey: privkey_hex,
+                    });
+                }
+            },
+            3 => {
+                // XRP derivation branch
+                for i in start_index..=end_index {
+                    let path_str = if use_hardened_index {
+                        format!("m/44'/144'/0'/0/{}'", i)
+                    } else {
+                        format!("m/44'/144'/0'/0/{}", i)
+                    };
+                    let path = path_str.parse::<DerivationPath>()
+                        .expect("Invalid derivation path");
+                    let child_xprv = master_xprv.derive_priv(&secp, &path)
+                        .expect("Derivation failed");
+                    let child_pubkey = PublicKey::from_secret_key(&secp, &child_xprv.private_key);
+                    let xrp_addr = xrp_address_from_pubkey(&child_pubkey);
+                    let pubkey_hex = hex::encode(child_pubkey.serialize());
+                    let privkey_hex = hex::encode(child_xprv.private_key.secret_bytes());
+                    address_entries.push(AddressEntry {
+                        index: i,
+                        address: xrp_addr,
+                        pubkey: pubkey_hex,
+                        privkey: privkey_hex,
+                    });
+                }
+            },
+            4 => {
+                // Solana derivation (fixed hardened path)
+                for i in start_index..=end_index {
+                    let path_str = format!("m/44'/501'/0'/0'/{}'", i);
+                    let path = path_str.parse::<BIP32Path>()
+                        .expect("Failed to parse BIP32 path for Solana");
+                    let derived = derive_key_from_path(&seed, Curve::Ed25519, &path)
+                        .expect("Failed to derive ed25519 key for Solana");
+                
+                    let signing_key = SigningKey::from_bytes(&derived.key);
+                    let verifying_key = VerifyingKey::from(&signing_key);
+                
+                    let sol_address = bs58::encode(verifying_key.to_bytes()).into_string();
+                    let pubkey_hex = hex::encode(verifying_key.to_bytes());
+                    let privkey_hex = hex::encode(signing_key.to_bytes());
+                
+                    address_entries.push(AddressEntry {
+                        index: i,
+                        address: sol_address,
                         pubkey: pubkey_hex,
                         privkey: privkey_hex,
                     });
@@ -784,6 +948,7 @@ fn main() {
         stdout.execute(Clear(ClearType::All)).unwrap();
         stdout.execute(crossterm::cursor::MoveTo(0, 0)).unwrap();
         return;
+
     }
 
     let (recovered_entropy, mnemonic_phrase) = if seed_option == 2 {
@@ -807,7 +972,7 @@ fn main() {
         
         print!("Do not enter duplicate shares. ");
         stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
-        print!("\x1b[1;31;5m[!]\x1b[0m"); // Blinking red exclamation mark at the end
+        print!("\x1b[1;31;5m[!]\x1b[0m");
         stdout.execute(ResetColor).unwrap();
         println!();
         
@@ -1050,7 +1215,7 @@ fn main() {
         )
     };
 
-    let passphrase = prompt_user_input("\nEnter an optional passphrase for seed derivation (press Enter for none): ", theme_colors.input_prompt);
+    let passphrase = prompt_user_input("\nEnter an optional passphrase for seed derivation (leave blank for none): ", theme_colors.input_prompt);
     let mnemonic = bip39::Mnemonic::parse_in_normalized(bip39::Language::English, &mnemonic_phrase)
         .expect("Failed to parse mnemonic");
     let seed = mnemonic.to_seed(&passphrase);
@@ -1164,7 +1329,6 @@ fn main() {
                 }
                 sskr_backup.push(group_vec);
             }
-
             let backup = SeedBackup {
                 seed_phrase: mnemonic_phrase.to_string(),
                 passphrase: passphrase.to_string(),

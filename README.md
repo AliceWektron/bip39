@@ -84,6 +84,8 @@ This tool is designed to offer cryptocurrency users a robust way to:
     Uses Native SegWit P2WPKH addresses derived via the path `m/84'/0'/0'/0/i` (with an option for fully hardened derivation on the final index).
   - **Ethereum Addresses:**  
     Derives Ethereum/EVM addresses using the path `m/44'/60'/0'/0/i` (also offering the hardened index option).
+  - **Solana Addresses:**  
+    Derives Solana addresses using the path `m/44'/501'/0'/0/i` (with hardened indexes for key derivation).
   
 - **Address Table UI:**  
   Derived addresses, along with their public and private keys, are displayed in an interactive table where sensitive values can be toggled (masked/unmasked) using keyboard shortcuts.
