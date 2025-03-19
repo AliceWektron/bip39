@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aes-gcm = "*" 
+aes-gcm = "*"
 bip39 = { version = "*", features = ["all-languages"] }
 bitcoin = "*"
 bs58 = "*"
@@ -12,9 +12,11 @@ crossterm = "*"
 ed25519-dalek = "*"
 hex = "*"
 hmac = "*"
+libc = "*"
 pbkdf2 = "*"
 rand = { version = "0.8", features = ["std"] }
 ratatui = "*"
+seccomp = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 sha2 = "*"
@@ -22,3 +24,4 @@ slip10 = "*"
 sskr = "*"
 terminal_size = "*"
 tiny-keccak = { version = "*", features = ["keccak"] }
+zeroize = "*"
