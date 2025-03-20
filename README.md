@@ -25,7 +25,7 @@ This tool is designed to offer cryptocurrency users a robust way to:
 - **Automatically compute** the final (24th) word based on the remaining entropy and checksum.
 - **Recover** a lost seed by combining SSKR shares.
 - **Derive wallet addresses** from a provided BIP-32 Extended Private Key (xprv) for Bitcoin (Native SegWit P2WPKH) and Ethereum.
-- **Encrypt and backup** sensitive seed data into a JSON file using AES-256 GCM.
+- **Encrypt and backup** sensitive seed data into a JSON file using AES-256 GCM with robust key derivation via Argon2.
 
 ---
 
@@ -95,8 +95,8 @@ This tool is designed to offer cryptocurrency users a robust way to:
 - **Secure JSON Backup:**  
   The tool can encrypt the seed backup information (which includes the seed phrase, entropy, BIP-39 seed, BIP-32 root key, and SSKR backup details) into a JSON file.
   
-- **AES-256 GCM Encryption:**  
-  The backup file is encrypted using AES-256 GCM. Key derivation for encryption is performed using PBKDF2 with HMAC-SHA256 and a randomly generated salt and nonce to ensure strong cryptographic security.
+- **AES-256 GCM Encryption with Argon2 Key Derivation:**  
+  Backup files are encrypted using AES-256 GCM. The encryption key is derived from the user-provided password using Argon2id, a modern and memory-hard key derivation function that protects against brute-force attacks by using a configurable amount of computational effort, salt, and nonce.
 
 ### Cryptographic Security & Validation
 

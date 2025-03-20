@@ -31,8 +31,6 @@ use bitcoin::{
     Address, Network,
 };
 use bs58;
-use hmac::Hmac;
-use pbkdf2::pbkdf2;
 use rand::{rngs::OsRng, seq::SliceRandom, Rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,11 +38,10 @@ use sskr::{sskr_combine, sskr_generate, GroupSpec, Secret, Spec};
 use tiny_keccak::Hasher;
 use bip39;
 use terminal_size;
-
 use slip10::{derive_key_from_path, Curve, BIP32Path};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-type HmacSha256 = Hmac<Sha256>;
+use argon2::{Argon2, Algorithm, Params, Version};
 
 #[derive(Serialize, Deserialize)]
 struct SeedBackup {
@@ -136,7 +133,6 @@ fn prompt_single_key(prompt: &str, color: Color) -> char {
     key
 }
 
-
 fn await_key(seconds: u64, theme_colors: &ThemeColors) {
     let mut stdout = io::stdout();
     let start = Instant::now();
@@ -170,13 +166,21 @@ fn encrypt_data(plaintext: &str, password: &str) -> Vec<u8> {
     rng.fill(&mut salt);
     let mut nonce = [0u8; 12];
     rng.fill(&mut nonce);
-    let iterations = 100_000;
-    let mut key = [0u8; 32];
-    pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iterations, &mut key)
-        .expect("PBKDF2 key derivation failed");
+
+    let params = Params::new(256 * 1024, 100, 1, Some(32)).expect("Invalid Argon2 params");
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut key = vec![0u8; 32];
+    argon2
+        .hash_password_into(password.as_bytes(), &salt, &mut key)
+        .expect("Key derivation failed");
+
+    lock_sensitive_data(&mut key);
+
     let cipher = Aes256Gcm::new_from_slice(&key).expect("Invalid key length");
     let nonce_ga = Nonce::<Aes256Gcm>::from_slice(&nonce);
-    let ciphertext = cipher.encrypt(nonce_ga, plaintext.as_bytes())
+    let ciphertext = cipher
+        .encrypt(nonce_ga, plaintext.as_bytes())
         .expect("Encryption failure!");
     let mut output = Vec::new();
     output.extend_from_slice(&salt);
@@ -192,17 +196,46 @@ fn decrypt_data(ciphertext: &[u8], password: &str) -> Result<String, String> {
     let salt = &ciphertext[0..16];
     let nonce = &ciphertext[16..28];
     let actual_ciphertext = &ciphertext[28..];
-    let iterations = 100_000;
-    let mut key = [0u8; 32];
-    pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iterations, &mut key)
-        .expect("PBKDF2 key derivation failed");
+
+    let params = Params::new(256 * 1024, 100, 1, Some(32))
+        .map_err(|_| "Invalid Argon2 params".to_string())?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut key = vec![0u8; 32];
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .map_err(|_| "Key derivation failed".to_string())?;
+
+    lock_sensitive_data(&mut key);
+
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|_| "Invalid key".to_string())?;
     let nonce_ga = Nonce::<Aes256Gcm>::from_slice(nonce);
-    let decrypted_bytes = cipher.decrypt(nonce_ga, actual_ciphertext)
+    let decrypted_bytes = cipher
+        .decrypt(nonce_ga, actual_ciphertext)
         .map_err(|_| "Decryption failed".to_string())?;
     String::from_utf8(decrypted_bytes)
         .map_err(|_| "Decrypted data is not valid UTF-8".to_string())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn lock_sensitive_data(data: &mut [u8]) {
+    use memsec::mlock;
+    let locked = unsafe { mlock(data.as_mut_ptr(), data.len()) };
+    if !locked {
+         eprintln!("Warning: Failed to lock memory");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn lock_sensitive_data(data: &mut [u8]) {
+    use std::ptr::null_mut;
+    use winapi::um::memoryapi::VirtualLock;
+    use winapi::shared::minwindef::LPVOID;
+    let ret = unsafe { VirtualLock(data.as_mut_ptr() as LPVOID, data.len()) };
+    if ret == 0 {
+        eprintln!("Warning: Failed to lock memory using VirtualLock");
+    }
 }
 
 fn hidden_input(prompt: &str, color: Color) -> String {
@@ -246,7 +279,7 @@ fn hidden_input(prompt: &str, color: Color) -> String {
     }
     disable_raw_mode().unwrap();
     println!();
-    password
+    password.trim().to_string()
 }
 
 fn bits_from_u16(num: u16, bits: usize) -> Vec<bool> {
@@ -506,14 +539,38 @@ fn run_backup_text_ui(
                         let mut stdout = io::stdout();
                         stdout.execute(Clear(ClearType::All))?;
                         stdout.execute(cursor::MoveTo(0, 0))?;
-                        println!("\nEnter a password to encrypt your JSON file: ");
-                        let mut encryption_password = String::new();
-                        io::stdin().read_line(&mut encryption_password)?;
-                        let encryption_password = encryption_password.trim();
+                        let encryption_password = loop {
+                            let pass1 = hidden_input(
+                                "\nEnter a password to encrypt your JSON file: ",
+                                theme_colors.input_prompt,
+                            );
+                            let pass2 = hidden_input("Re-enter password to confirm: ", theme_colors.input_prompt);
+                            if pass1 == pass2 {
+                                break pass1;
+                            } else {
+                                stdout.execute(SetForegroundColor(theme_colors.error))?;
+                                println!("Passwords do not match. Please try again.");
+                                stdout.execute(ResetColor)?;
+                            }
+                        };
                         let json_data = serde_json::to_string_pretty(&backup)?;
-                        let encrypted_json = encrypt_data(&json_data, encryption_password);
-                        let mut file = File::create("seed_backup.json.enc")?;
-                        file.write_all(&encrypted_json)?;
+                        let encrypted_json = encrypt_data(&json_data, &encryption_password);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            let mut file = std::fs::OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .mode(0o600)
+                                .open("seed_backup.json.enc")?;
+                            file.write_all(&encrypted_json)?;
+                        }
+                        #[cfg(windows)]
+                        {
+                            let mut file = File::create("seed_backup.json.enc")?;
+                            file.write_all(&encrypted_json)?;
+                        }
                         stdout.execute(Clear(ClearType::All))?;
                         stdout.execute(cursor::MoveTo(0, 0))?;
                         print!("Encrypted JSON file saved as ");
@@ -786,36 +843,41 @@ fn main() {
             stdout.execute(ResetColor).unwrap();
             return;
         }
-        let decryption_password = hidden_input(
-            "\nEnter the decryption password: ",
-            theme_colors.input_prompt,
-        );
-
-        stdout.execute(Clear(ClearType::All)).unwrap();
-        stdout.execute(cursor::MoveTo(0, 0)).unwrap();
         
-        match decrypt_data(&encrypted_data, &decryption_password) {
-            Ok(decrypted_json) => {
-                match serde_json::from_str::<SeedBackup>(&decrypted_json) {
-                    Ok(backup) => {
-                        if let Err(e) = run_backup_text_ui(backup, theme_colors.clone(), "Decrypted Seed Backup ", false) {
-                            eprintln!("Error in UI: {}", e);
+        loop {
+            let decryption_password = hidden_input(
+                "\nEnter the decryption password: ",
+                theme_colors.input_prompt,
+            );
+
+            match decrypt_data(&encrypted_data, &decryption_password) {
+                Ok(decrypted_json) => {
+                    match serde_json::from_str::<SeedBackup>(&decrypted_json) {
+                        Ok(backup) => {
+                            if let Err(e) = run_backup_text_ui(backup, theme_colors.clone(), "Decrypted Seed Backup ", false) {
+                                eprintln!("Error in UI: {}", e);
+                            }
+                            break;
+                        },
+                        Err(e) => {
+                            stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
+                            println!("Error parsing JSON: {}", e);
+                            stdout.execute(ResetColor).unwrap();
                         }
-                        
-                    },
-                    Err(e) => {
-                        stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
-                        println!("Error parsing JSON: {}", e);
-                        stdout.execute(ResetColor).unwrap();
                     }
+                },
+                Err(e) => {
+                    stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
+                    println!("Decryption failed: {}", e);
+                    stdout.execute(ResetColor).unwrap();
                 }
-            },
-            Err(e) => {
-                stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
-                println!("Decryption failed: {}", e);
-                stdout.execute(ResetColor).unwrap();
+            }
+            let try_again = prompt_single_key("Try again? (y/n): ", theme_colors.input_prompt);
+            if try_again.to_ascii_lowercase() != 'y' {
+                break;
             }
         }
+        
         stdout.execute(Clear(ClearType::All)).unwrap();
         stdout.execute(cursor::MoveTo(0, 0)).unwrap();
         return;
@@ -1337,7 +1399,19 @@ fn main() {
             .expect("Mnemonic validation unsuccessful");
         let recovered_entropy = bip39::Mnemonic::parse_in_normalized(language, &mnemonic_phrase)
             .expect("Failed to create mnemonic").to_entropy().to_vec();
-        let passphrase = prompt_user_input("\nEnter an optional passphrase for seed derivation (leave blank for none): ", theme_colors.input_prompt);
+
+        let passphrase = loop {
+            let pass1 = hidden_input("\nEnter an optional passphrase for seed derivation (leave blank for none): ", theme_colors.input_prompt);
+            let pass2 = hidden_input("Re-enter passphrase to confirm: ", theme_colors.input_prompt);
+            if pass1 == pass2 {
+                break pass1;
+            } else {
+                stdout.execute(SetForegroundColor(theme_colors.error)).unwrap();
+                println!("Passphrases do not match. Please try again.");
+                stdout.execute(ResetColor).unwrap();
+            }
+        };
+
         let mnemonic = bip39::Mnemonic::parse_in_normalized(bip39::Language::English, &mnemonic_phrase)
             .expect("Failed to parse mnemonic");
         let seed = mnemonic.to_seed(&passphrase);
@@ -1464,10 +1538,23 @@ fn main() {
                 if let Err(e) = run_backup_text_ui(backup, theme_colors.clone(), "SENSITIVE INFORMATION", true) {
                     eprintln!("Error in UI: {}", e);
                 }
-                stdout.execute(Clear(ClearType::All)).unwrap();
-                stdout.execute(cursor::MoveTo(0, 0)).unwrap();
-                return;
+            } else {
+                let backup = SeedBackup {
+                    seed_phrase: mnemonic_phrase.to_string(),
+                    passphrase: passphrase.to_string(),
+                    sskr: SskrBackup { groups: vec![] },
+                    entropy: hex::encode(&recovered_entropy),
+                    bip39_seed: hex::encode(&seed),
+                    bip32_root_key: format!("{}", master_xprv),
+                    recovery_info: String::new(),
+                };
+                if let Err(e) = run_backup_text_ui(backup, theme_colors.clone(), "SENSITIVE INFORMATION", true) {
+                    eprintln!("Error in UI: {}", e);
+                }
             }
+            stdout.execute(Clear(ClearType::All)).unwrap();
+            stdout.execute(cursor::MoveTo(0, 0)).unwrap();
+            return;
         }
     }
 }
