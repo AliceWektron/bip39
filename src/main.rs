@@ -1,48 +1,60 @@
+// Imports and Dependencies
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode},
     style::{Color, ResetColor, SetForegroundColor},
     terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, 
+        disable_raw_mode, enable_raw_mode,
     },
     ExecutableCommand,
 };
+
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color as TuiColor, Modifier, Style},
+    style::{Color as TuiColor, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row as TuiRow, Table as TuiTable, Wrap},
     Terminal,
 };
+use terminal_size::{Width, Height};
+
 use std::{
     fs::File,
     io::{self, BufRead, Read, Write},
     path::Path,
     time::{Duration, Instant},
 };
+
 use aes_gcm::{
     aead::{Aead, KeyInit, Nonce},
     Aes256Gcm,
 };
+
+use argon2::{Argon2, Algorithm, Params, Version};
+use sha2::{Digest, Sha256};
+use tiny_keccak::Hasher;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use slip10::{derive_key_from_path, Curve, BIP32Path};
+use sskr::{sskr_combine, sskr_generate, GroupSpec, Secret, Spec};
 use bitcoin::{
     bip32::{DerivationPath, Xpriv},
     secp256k1::{PublicKey, Secp256k1},
     Address, Network,
 };
 use bs58;
-use rand::{rngs::OsRng, seq::SliceRandom, Rng};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use sskr::{sskr_combine, sskr_generate, GroupSpec, Secret, Spec};
-use tiny_keccak::Hasher;
 use bip39;
-use terminal_size;
-use slip10::{derive_key_from_path, Curve, BIP32Path};
-use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use argon2::{Argon2, Algorithm, Params, Version};
+use rand::{rngs::OsRng, seq::SliceRandom, Rng};
 
+use serde::{Deserialize, Serialize};
+
+use qrcode::QrCode;
+use image::Luma;
+use viuer;
+
+// Structs and Data Types
 #[derive(Serialize, Deserialize)]
 struct SeedBackup {
     seed_phrase: String,
@@ -68,98 +80,73 @@ struct Share {
 #[derive(Clone)]
 struct ThemeColors {
     header: Color,
+    highlighted: Color,
+    final_output: Color,
+    candidate_header: Color,
     position_label: Color,
     input_prompt: Color,
     random_message: Color,
     error: Color,
-    candidate_header: Color,
-    final_output: Color,
 }
 
+#[derive(Debug)]
+struct AddressEntry {
+    index: u32,
+    address: String,
+    pubkey: String,
+    privkey: String,
+}
+
+// Theming & Color Conversion
 fn get_catppuccin_mocha_theme() -> ThemeColors {
     ThemeColors {
         header: Color::Rgb { r: 198, g: 160, b: 246 },
+        highlighted: Color::Rgb { r: 255, g: 140, b: 0 },
+        final_output: Color::Rgb { r: 166, g: 218, b: 149 },
+        candidate_header: Color::Rgb { r: 183, g: 189, b: 248 },
         position_label: Color::Rgb { r: 238, g: 212, b: 159 },
         input_prompt: Color::Rgb { r: 145, g: 215, b: 227 },
         random_message: Color::Rgb { r: 138, g: 173, b: 244 },
         error: Color::Rgb { r: 237, g: 135, b: 150 },
-        candidate_header: Color::Rgb { r: 183, g: 189, b: 248 },
-        final_output: Color::Rgb { r: 166, g: 218, b: 149 },
     }
 }
 
-fn prompt_user_input(prompt: &str, color: Color) -> String {
-    let mut stdout = io::stdout();
-    stdout.execute(SetForegroundColor(color)).unwrap();
-    print!("{}", prompt);
-    stdout.execute(ResetColor).unwrap();
-    io::stdout().flush().unwrap();
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
-    let mut buffer = Vec::new();
-    handle.read_until(b'\n', &mut buffer).expect("Failed to read input");
-    String::from_utf8_lossy(&buffer).trim().to_string()
-}
-
-fn prompt_single_key(prompt: &str, color: Color) -> char {
-    let mut stdout = io::stdout();
-    enable_raw_mode().unwrap();
-    stdout.execute(Clear(ClearType::All)).unwrap();
-    stdout.execute(cursor::MoveTo(0, 0)).unwrap();
-    stdout.execute(SetForegroundColor(color)).unwrap();
-    let lines: Vec<&str> = prompt.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        stdout.execute(Clear(ClearType::CurrentLine)).unwrap();
-        stdout.execute(cursor::MoveToColumn(0)).unwrap();
-        if i == lines.len() - 1 {
-            print!("{}", line);
-        } else {
-            println!("{}", line);
-        }
+fn convert_color(color: Color) -> TuiColor {
+    match color {
+        Color::Rgb { r, g, b } => TuiColor::Rgb(r, g, b),
+        _ => TuiColor::Reset,
     }
-    stdout.execute(ResetColor).unwrap();
-    stdout.flush().unwrap();
-    let key = loop {
-        if event::poll(Duration::from_millis(100)).unwrap() {
-            if let Event::Key(key_event) = event::read().unwrap() {
-                match key_event.code {
-                    KeyCode::Char(c) => break c,
-                    _ => break '?',
-                }
-            }
-        }
-    };
-    disable_raw_mode().unwrap();
-    key
 }
 
-fn await_key(seconds: u64, theme_colors: &ThemeColors) {
-    let mut stdout = io::stdout();
-    let start = Instant::now();
-    let mut remaining = seconds;
-    loop {
-        stdout.execute(SetForegroundColor(theme_colors.input_prompt)).unwrap();
-        stdout.execute(Clear(ClearType::CurrentLine)).unwrap();
-        print!(
-            "\rPress any key to skip now, or wait {} second{}",
-            remaining,
-            if remaining == 1 { "" } else { "s" }
-        );
-        stdout.flush().unwrap();
-        stdout.execute(ResetColor).unwrap();
-        if event::poll(Duration::from_millis(100)).unwrap() {
-            if let Event::Key(_) = event::read().unwrap() {
-                break;
-            }
-        }
-        if start.elapsed().as_secs() >= seconds {
-            break;
-        }
-        remaining = seconds.saturating_sub(start.elapsed().as_secs());
+// Bit Manipulation Helpers
+fn bits_from_u16(num: u16, bits: usize) -> Vec<bool> {
+    let mut bits_vec = Vec::with_capacity(bits);
+    for i in (0..bits).rev() {
+        bits_vec.push((num >> i) & 1 == 1);
     }
-    println!();
+    bits_vec
 }
 
+fn bits_to_u16(bits: &[bool]) -> u16 {
+    bits.iter().fold(0, |acc, &bit| (acc << 1) | if bit { 1 } else { 0 })
+}
+
+fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for chunk in bits.chunks(8) {
+        let mut byte = 0u8;
+        for &bit in chunk {
+            byte = (byte << 1) | if bit { 1 } else { 0 };
+        }
+        if chunk.len() < 8 {
+            byte <<= 8 - chunk.len();
+        }
+        bytes.push(byte);
+    }
+    bytes
+}
+
+// Encryption, Decryption & Security Functions
 fn encrypt_data(plaintext: &str, password: &str) -> Vec<u8> {
     let mut rng = OsRng;
     let mut salt = [0u8; 16];
@@ -238,77 +225,7 @@ fn lock_sensitive_data(data: &mut [u8]) {
     }
 }
 
-fn hidden_input(prompt: &str, color: Color) -> String {
-    use crossterm::{
-        event::{self, Event, KeyCode},
-        style::{SetForegroundColor, ResetColor},
-        cursor,
-        terminal::{enable_raw_mode, disable_raw_mode},
-    };
-    let mut stdout = io::stdout();
-    stdout.execute(SetForegroundColor(color)).unwrap();
-    print!("{}", prompt);
-    stdout.execute(ResetColor).unwrap();
-    stdout.flush().unwrap();
-
-    enable_raw_mode().unwrap();
-    let mut password = String::new();
-    loop {
-        if event::poll(Duration::from_millis(100)).unwrap() {
-            if let Event::Key(key_event) = event::read().unwrap() {
-                match key_event.code {
-                    KeyCode::Enter => break,
-                    KeyCode::Char(c) => {
-                        password.push(c);
-                        print!("*");
-                        stdout.flush().unwrap();
-                    },
-                    KeyCode::Backspace => {
-                        if !password.is_empty() {
-                            password.pop();
-                            stdout.execute(cursor::MoveLeft(1)).unwrap();
-                            print!(" ");
-                            stdout.execute(cursor::MoveLeft(1)).unwrap();
-                            stdout.flush().unwrap();
-                        }
-                    },
-                    _ => {}
-                }
-            }
-        }
-    }
-    disable_raw_mode().unwrap();
-    println!();
-    password.trim().to_string()
-}
-
-fn bits_from_u16(num: u16, bits: usize) -> Vec<bool> {
-    let mut bits_vec = Vec::with_capacity(bits);
-    for i in (0..bits).rev() {
-        bits_vec.push((num >> i) & 1 == 1);
-    }
-    bits_vec
-}
-
-fn bits_to_u16(bits: &[bool]) -> u16 {
-    bits.iter().fold(0, |acc, &bit| (acc << 1) | if bit { 1 } else { 0 })
-}
-
-fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for chunk in bits.chunks(8) {
-        let mut byte = 0u8;
-        for &bit in chunk {
-            byte = (byte << 1) | if bit { 1 } else { 0 };
-        }
-        if chunk.len() < 8 {
-            byte <<= 8 - chunk.len();
-        }
-        bytes.push(byte);
-    }
-    bytes
-}
-
+// Blockchain Address Generation Functions
 fn ethereum_address_from_pubkey(pubkey: &PublicKey) -> String {
     let uncompressed = pubkey.serialize_uncompressed();
     let pubkey_bytes = &uncompressed[1..];
@@ -355,14 +272,7 @@ fn xrp_address_from_pubkey(pubkey: &PublicKey) -> String {
     bs58::encode(payload).with_alphabet(&alphabet).into_string()
 }
 
-fn print_dashed_line() {
-    if let Some((width, _)) = terminal_size::terminal_size() {
-        println!("{}", "─".repeat(width.0 as usize));
-    } else {
-        println!("{}", "─".repeat(40));
-    }
-}
-
+// Mnemonic & SSKR Helpers
 fn share_to_mnemonic(share: &[u8], language: bip39::Language) -> String {
     let share_len = share.len() as u16;
     let mut bit_vec = bits_from_u16(share_len, 16);
@@ -420,81 +330,128 @@ fn language_from_choice(_choice: u8) -> bip39::Language {
     bip39::Language::English
 }
 
-#[derive(Debug)]
-struct AddressEntry {
-    index: u32,
-    address: String,
-    pubkey: String,
-    privkey: String,
+// User Input & UI Functions
+fn prompt_user_input(prompt: &str, color: Color) -> String {
+    let mut stdout = io::stdout();
+    stdout.execute(SetForegroundColor(color)).unwrap();
+    print!("{}", prompt);
+    stdout.execute(ResetColor).unwrap();
+    io::stdout().flush().unwrap();
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    let mut buffer = Vec::new();
+    handle.read_until(b'\n', &mut buffer).expect("Failed to read input");
+    String::from_utf8_lossy(&buffer).trim().to_string()
 }
 
-fn convert_color(color: Color) -> TuiColor {
-    match color {
-        Color::Rgb { r, g, b } => TuiColor::Rgb(r, g, b),
-        _ => TuiColor::Reset,
+fn prompt_single_key(prompt: &str, color: Color) -> char {
+    let mut stdout = io::stdout();
+    enable_raw_mode().unwrap();
+    stdout.execute(Clear(ClearType::All)).unwrap();
+    stdout.execute(cursor::MoveTo(0, 0)).unwrap();
+    stdout.execute(SetForegroundColor(color)).unwrap();
+    let lines: Vec<&str> = prompt.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        stdout.execute(Clear(ClearType::CurrentLine)).unwrap();
+        stdout.execute(cursor::MoveToColumn(0)).unwrap();
+        if i == lines.len() - 1 {
+            print!("{}", line);
+        } else {
+            println!("{}", line);
+        }
     }
+    stdout.execute(ResetColor).unwrap();
+    stdout.flush().unwrap();
+    let key = loop {
+        if event::poll(Duration::from_millis(100)).unwrap() {
+            if let Event::Key(key_event) = event::read().unwrap() {
+                match key_event.code {
+                    KeyCode::Char(c) => break c,
+                    _ => break '?',
+                }
+            }
+        }
+    };
+    disable_raw_mode().unwrap();
+    key
 }
 
-fn format_backup_styled(
-    backup: &SeedBackup,
-    mask_state: bool,
-    output_color: Color,
-) -> Vec<Line<'static>> {
-    let out_color = convert_color(output_color);
-    let mask = |s: &str| if mask_state { "*".repeat(s.len()) } else { s.to_string() };
+fn await_key(seconds: u64, theme_colors: &ThemeColors) {
+    let mut stdout = io::stdout();
+    let start = Instant::now();
+    let mut remaining = seconds;
+    loop {
+        stdout.execute(SetForegroundColor(theme_colors.input_prompt)).unwrap();
+        stdout.execute(Clear(ClearType::CurrentLine)).unwrap();
+        print!(
+            "\rPress any key to skip now, or wait {} second{}",
+            remaining,
+            if remaining == 1 { "" } else { "s" }
+        );
+        stdout.flush().unwrap();
+        stdout.execute(ResetColor).unwrap();
+        if event::poll(Duration::from_millis(100)).unwrap() {
+            if let Event::Key(_) = event::read().unwrap() {
+                break;
+            }
+        }
+        if start.elapsed().as_secs() >= seconds {
+            break;
+        }
+        remaining = seconds.saturating_sub(start.elapsed().as_secs());
+    }
+    println!();
+}
 
-    let mut lines = Vec::new();
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::raw("Seed Phrase: "),
-        Span::styled(mask(&backup.seed_phrase), Style::default().fg(out_color)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw("Passphrase: "),
-        Span::styled(mask(&backup.passphrase), Style::default().fg(out_color)),
-    ]));
-    lines.push(Line::from(""));
-    if !backup.sskr.groups.is_empty() {
-        lines.push(Line::from("SSKR Backup:"));
-        for (group_index, group_shares) in backup.sskr.groups.iter().enumerate() {
-            lines.push(Line::from(format!("Group {} Shares:", group_index + 1)));
-            for (share_index, share) in group_shares.iter().enumerate() {
-                lines.push(Line::from(vec![
-                    Span::raw(format!("  Share {}: Hex: ", share_index + 1)),
-                    Span::styled(mask(&share.share_hex), Style::default().fg(out_color)),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::raw("           Mnemonic: "),
-                    Span::styled(mask(&share.mnemonic), Style::default().fg(out_color)),
-                ]));
+fn hidden_input(prompt: &str, color: Color) -> String {
+    use crossterm::{
+        event::{self, KeyCode},
+        style::{SetForegroundColor, ResetColor},
+        cursor,
+        terminal::{enable_raw_mode, disable_raw_mode},
+    };
+    let mut stdout = io::stdout();
+    stdout.execute(SetForegroundColor(color)).unwrap();
+    print!("{}", prompt);
+    stdout.execute(ResetColor).unwrap();
+    stdout.flush().unwrap();
+
+    enable_raw_mode().unwrap();
+    let mut password = String::new();
+    loop {
+        if event::poll(Duration::from_millis(100)).unwrap() {
+            if let Event::Key(key_event) = event::read().unwrap() {
+                match key_event.code {
+                    KeyCode::Enter => break,
+                    KeyCode::Char(c) => {
+                        password.push(c);
+                        print!("*");
+                        stdout.flush().unwrap();
+                    },
+                    KeyCode::Backspace => {
+                        if !password.is_empty() {
+                            password.pop();
+                            stdout.execute(cursor::MoveLeft(1)).unwrap();
+                            print!(" ");
+                            stdout.execute(cursor::MoveLeft(1)).unwrap();
+                            stdout.flush().unwrap();
+                        }
+                    },
+                    _ => {}
+                }
             }
         }
     }
-    if !backup.recovery_info.is_empty() && !backup.sskr.groups.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(backup.recovery_info.clone()));
-        lines.push(Line::from(""));
-    }    
-    lines.push(Line::from(vec![
-        Span::raw("Entropy: "),
-        Span::styled(mask(&backup.entropy), Style::default().fg(out_color)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw("BIP-39 Seed: "),
-        Span::styled(mask(&backup.bip39_seed), Style::default().fg(out_color)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw("BIP-32 Root Key (xprv): "),
-        Span::styled(mask(&backup.bip32_root_key), Style::default().fg(out_color)),
-    ]));
-    lines
+    disable_raw_mode().unwrap();
+    println!();
+    password.trim().to_string()
 }
 
 fn run_backup_text_ui(
     backup: SeedBackup,
     theme_colors: ThemeColors,
     title: &str,
-    show_save: bool
+    show_save: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -595,13 +552,70 @@ fn run_backup_text_ui(
     Ok(())
 }
 
-fn run_address_table_ui(address_entries: Vec<AddressEntry>, addr_type: u8, _theme_colors: &ThemeColors) -> Result<bool, Box<dyn std::error::Error>> {
+fn format_backup_styled(
+    backup: &SeedBackup,
+    mask_state: bool,
+    output_color: Color,
+) -> Vec<Line<'static>> {
+    let out_color = convert_color(output_color);
+    let mask = |s: &str| if mask_state { "*".repeat(s.len()) } else { s.to_string() };
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("Seed Phrase: "),
+        Span::styled(mask(&backup.seed_phrase), Style::default().fg(out_color)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("Passphrase: "),
+        Span::styled(mask(&backup.passphrase), Style::default().fg(out_color)),
+    ]));
+    lines.push(Line::from(""));
+    if !backup.sskr.groups.is_empty() {
+        lines.push(Line::from("SSKR Backup:"));
+        for (group_index, group_shares) in backup.sskr.groups.iter().enumerate() {
+            lines.push(Line::from(format!("Group {} Shares:", group_index + 1)));
+            for (share_index, share) in group_shares.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::raw(format!("  Share {}: Hex: ", share_index + 1)),
+                    Span::styled(mask(&share.share_hex), Style::default().fg(out_color)),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("           Mnemonic: "),
+                    Span::styled(mask(&share.mnemonic), Style::default().fg(out_color)),
+                ]));
+            }
+        }
+    }
+    if !backup.recovery_info.is_empty() && !backup.sskr.groups.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(backup.recovery_info.clone()));
+        lines.push(Line::from(""));
+    }    
+    lines.push(Line::from(vec![
+        Span::raw("Entropy: "),
+        Span::styled(mask(&backup.entropy), Style::default().fg(out_color)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("BIP-39 Seed: "),
+        Span::styled(mask(&backup.bip39_seed), Style::default().fg(out_color)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("BIP-32 Root Key (xprv): "),
+        Span::styled(mask(&backup.bip32_root_key), Style::default().fg(out_color)),
+    ]));
+    lines
+}
+
+fn run_address_table_ui(address_entries: Vec<AddressEntry>, addr_type: u8, theme_colors: &ThemeColors) -> Result<bool, Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut mask_state = true;
+    let mut selected_row: usize = 0;
+
     loop {
         terminal.draw(|f| {
             let chunks = Layout::default()
@@ -609,14 +623,19 @@ fn run_address_table_ui(address_entries: Vec<AddressEntry>, addr_type: u8, _them
                 .margin(1)
                 .constraints([Constraint::Percentage(90), Constraint::Percentage(10)].as_ref())
                 .split(f.area());
-            let rows = address_entries.iter().map(|entry| {
+            let rows = address_entries.iter().enumerate().map(|(i, entry)| {
                 let priv_display = if mask_state { "*".repeat(entry.privkey.len()) } else { entry.privkey.clone() };
-                TuiRow::new(vec![
+                let row = TuiRow::new(vec![
                     entry.index.to_string(),
                     entry.address.clone(),
                     entry.pubkey.clone(),
                     priv_display,
-                ])
+                ]);
+                if i == selected_row {
+                    row.style(Style::default().bg(convert_color(theme_colors.highlighted)))
+                } else {
+                    row
+                }
             });
             let table = TuiTable::new(rows, vec![
                     Constraint::Percentage(5),
@@ -625,7 +644,6 @@ fn run_address_table_ui(address_entries: Vec<AddressEntry>, addr_type: u8, _them
                     Constraint::Percentage(35),
                 ])
                 .header(TuiRow::new(vec!["Index", "Address", "Public Key", "Private Key"])
-                    .style(Style::default().fg(TuiColor::Yellow).add_modifier(Modifier::BOLD))
                     .bottom_margin(1))
                 .block(Block::default()
                     .borders(Borders::ALL)
@@ -637,7 +655,7 @@ fn run_address_table_ui(address_entries: Vec<AddressEntry>, addr_type: u8, _them
                         _ => "Derived Addresses",
                     }));
             f.render_widget(table, chunks[0]);
-            let note = Paragraph::new("Press [Tab] to toggle private key visibility, [r] to return to address type selection, [q] to exit.")
+            let note = Paragraph::new("Use arrow keys to navigate, [Tab] to toggle private key visibility, [Enter] to show QR code, [r] to return, [q] to exit.")
                 .style(Style::default().fg(TuiColor::White));
             f.render_widget(note, chunks[1]);
         })?;
@@ -657,11 +675,73 @@ fn run_address_table_ui(address_entries: Vec<AddressEntry>, addr_type: u8, _them
                         terminal.show_cursor()?;
                         return Ok(false);
                     },
+                    KeyCode::Up => {
+                        if selected_row > 0 {
+                            selected_row -= 1;
+                        }
+                    },
+                    KeyCode::Down => {
+                        if selected_row < address_entries.len() - 1 {
+                            selected_row += 1;
+                        }
+                    },
+                    KeyCode::Enter => {
+                        show_qr_popup(&address_entries[selected_row].privkey)?;
+                        terminal.draw(|_f| {})?;
+                    },
                     _ => {}
                 }
             }
         }
     }
+}
+
+fn show_qr_popup(data: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let code = QrCode::new(data.as_bytes())?;
+    let image = code.render::<Luma<u8>>()
+                    .min_dimensions(38, 38)
+                    .build();
+    
+    let temp_file = "qr_temp.png";
+    image.save(temp_file)?;
+    
+    let (term_width, term_height) = if let Some((Width(w), Height(h))) = terminal_size::terminal_size() {
+        (w, h)
+    } else {
+        (80, 24)
+    };
+    let center_x = (term_width.saturating_sub(38)) / 2;
+    let center_y = (term_height.saturating_sub(38)) / 2;
+    
+    let config = viuer::Config {
+        width: Some(38),
+        height: Some(38),
+        x: center_x as u16,
+        y: center_y as i16,
+        transparent: true,
+        ..Default::default()
+    };
+    
+    let mut stdout = io::stdout();
+    stdout.execute(Clear(ClearType::All))?;
+    stdout.execute(cursor::MoveTo(0, 0))?;
+    viuer::print_from_file(temp_file, &config)?;
+    
+    loop {
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key_event) = event::read()? {
+                if key_event.code == KeyCode::Esc {
+                    break;
+                }
+            }
+        }
+    }
+    
+    stdout.execute(Clear(ClearType::All))?;
+    stdout.execute(cursor::MoveTo(0, 0))?;
+    
+    std::fs::remove_file(temp_file)?;
+    Ok(())
 }
 
 fn get_manual_seed(theme_colors: &ThemeColors) -> (bip39::Mnemonic, Vec<u8>) {
@@ -728,6 +808,7 @@ fn get_manual_seed(theme_colors: &ThemeColors) -> (bip39::Mnemonic, Vec<u8>) {
     }
 }
 
+// Main Function
 fn main() {
     let mut stdout = io::stdout();
     print!("\x1B[3J");
@@ -1556,5 +1637,13 @@ fn main() {
             stdout.execute(cursor::MoveTo(0, 0)).unwrap();
             return;
         }
+    }
+}
+
+fn print_dashed_line() {
+    if let Some((width, _)) = terminal_size::terminal_size() {
+        println!("{}", "─".repeat(width.0 as usize));
+    } else {
+        println!("{}", "─".repeat(40));
     }
 }

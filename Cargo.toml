@@ -4,23 +4,30 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Cryptography & Blockchain
 aes-gcm = "*"
 argon2 = "*"
+sha2 = "*"
+tiny-keccak = { version = "*", features = ["keccak"] }
+ed25519-dalek = "*"
+slip10 = "*"
+sskr = "*"
 bip39 = { version = "*", features = ["all-languages"] }
 bitcoin = "*"
 bs58 = "*"
-crossterm = "*"
-ed25519-dalek = "*"
 hex = "*"
 memsec = "*"  
-rand = { version = "0.8", features = ["std"] }
+winapi = { version = "0.3", features = ["winnt", "memoryapi"] }
+
+# Terminal UI & Graphics
+crossterm = "*"
 ratatui = "*"
+terminal_size = "*"
+viuer = { version = "0.9.1", features = ["print-file"] }
+qrcode = "*"
+image = "*"
+
+# Utilities
+rand = { version = "0.8", features = ["std"] }
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
-sha2 = "*"
-slip10 = "*"
-sskr = "*"
-subtle = "*"
-terminal_size = "*"
-tiny-keccak = { version = "*", features = ["keccak"] }
-winapi = { version = "0.3", features = ["winnt", "memoryapi"] }
