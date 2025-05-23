@@ -21,7 +21,11 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_path: target/x86_64-apple-darwin/release/bip39
-            artifact_name: bip39_macos
+            artifact_name: bip39_macos_intel
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_path: target/aarch64-apple-darwin/release/bip39
+            artifact_name: bip39_macos_arm
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout Repository
@@ -47,7 +51,7 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build 64-bit Binary
+      - name: Build Binary
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Run Tests
@@ -61,4 +65,45 @@ jobs:
           if-no-files-found: warn
           compression-level: 6
           overwrite: true
-          include-hidden-files: false
+
+  create-universal-macos:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - name: Download Intel macOS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: bip39_macos_intel
+          path: ./intel
+
+      - name: Download ARM macOS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: bip39_macos_arm
+          path: ./arm
+
+      - name: Check if both binaries exist
+        id: check_binaries
+        run: |
+          if [[ -f "intel/bip39" && -f "arm/bip39" ]]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Universal Binary
+        if: steps.check_binaries.outputs.found == 'true'
+        run: |
+          lipo -create \
+            intel/bip39 \
+            arm/bip39 \
+            -output bip39_universal
+
+      - name: Upload Universal Binary Artifact
+        if: steps.check_binaries.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bip39_macos_universal
+          path: bip39_universal
+          compression-level: 6
+          overwrite: true
